@@ -1,0 +1,38 @@
+{
+    "apiVersion": "1.3",
+    "version": "1.2.2",
+    "name": "Wellbore Schematic",
+    "id": "spotfire-wb-schematic-mod",
+    "icon": "icon.svg",
+    "dataViewDefinition": {
+        "tooltip": { "enabled": true },
+        "axes": [
+            {
+                "name": "md",
+                "mode": "continuous",
+                "allowMultipleMeasures": false,
+                "allowNonAggregatingMeasures":true,
+                "placement": "left"
+            },
+            {
+                "name": "inc",
+                "mode": "continuous",
+                "allowMultipleMeasures": false,
+                "allowNonAggregatingMeasures":true,
+                "placement": "left"
+            },
+            {
+                "name": "az",
+                "mode": "continuous",
+                "allowMultipleMeasures": false,
+                "allowNonAggregatingMeasures":true,
+                "placement": "left"
+            }
+        ]
+    },
+    "files": [
+        "index.html",
+        "main.css",
+        "bundle.js"
+    ]
+}
