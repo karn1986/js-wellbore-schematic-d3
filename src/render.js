@@ -44,7 +44,7 @@ export async function render(state, mod, dataView, windowSize) {
     }
 
     // The margins around the chart canvas.
-    let margin = { top: 20, right: 40, bottom: 40, left: 80 };
+    const margin = { top: 20, right: 40, bottom: 40, left: 80 };
     // wellbore radius in pixels
     const r = 0.025 * Math.min(windowSize.height, windowSize.width);
     // The position and size of the chart canvas.
@@ -55,9 +55,14 @@ export async function render(state, mod, dataView, windowSize) {
         height: windowSize.height - (margin.top + margin.bottom)
 
     };
+    /**
+     * Sets the viewBox to match windowSize
+     */
+    svg.attr("viewBox", [0, 0, windowSize.width, windowSize.height]);
+    svg.selectAll("*").remove();
+
     if (canvas.height < 0 || canvas.width < 0) {
         // Abort rendering if the window is not large enough to render anything.
-        svg.selectAll("*").remove();
         return;
     }
 
@@ -78,7 +83,6 @@ export async function render(state, mod, dataView, windowSize) {
      */
     let errors = await dataView.getErrors();
     if (errors.length > 0) {
-        svg.selectAll("*").remove();
         mod.controls.errorOverlay.show(errors, "dataView");
         return;
     }
@@ -86,18 +90,49 @@ export async function render(state, mod, dataView, windowSize) {
     mod.controls.errorOverlay.hide("dataView");
 
     const allrows = await dataView.allRows();
+    const survey = get_survey(allrows, mod);
+    const processed_survey = min_curvature_algo(survey);
+    const {xScale, yScale} = get_scales(processed_survey, margin, windowSize);
+    compute_slope(processed_survey, xScale, yScale);
+
+    let curve = d3.curveCatmullRom.alpha(1);
+    /**
+     * Prepare groups that will hold all elements of chart.
+     */
+    svg.append("g").attr("class", "wellbore");
+    svg.append("g").attr("class", "axes");
+    /**
+     * Style all strokes and text using current theme.
+     */
+    svg.selectAll("path").attr("stroke", styling.scales.line.stroke);
+    svg.selectAll("line").attr("stroke", styling.scales.tick.stroke);
+    svg.selectAll("text")
+        .attr("fill", styling.scales.font.color)
+        .attr("font-family", styling.scales.font.fontFamily)
+        .attr("font-size", styling.scales.font.fontSize);
+
+    draw_axes(svg.select(".axes"), xScale, yScale, windowSize, margin);
+    draw_wellbore(svg.select(".wellbore"), processed_survey, xScale, yScale, curve, r, tooltip)
+}
+// --------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------
+// HELPER FUNCTIONS
+// --------------------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------------------
+// function to preprocess and validate survey data
+function get_survey(allrows, mod) {
     let survey;
     try{
-        survey = allrows.map(d => {
+        survey = allrows.map((d, i) => {
             const md = d.continuous("md").value();
             const inc  = d.continuous("inc").value();
             const az = d.continuous("az").value();
             if ((inc < 0) || (inc > 180)) {
-                throw new Error(`Inclination ${inc} out of range. check survey`);
+                throw new Error(`Inclination ${inc} out of range at row ${i+1}. check survey`);
             } else if(md<0) {
-                throw new Error(`MD ${md} cannot be negative. check survey`);
+                throw new Error(`MD ${md} cannot be negative. check survey at row ${i+1}`);
             } else if (az < 0 || az > 360){
-                throw new Error(`Azimuth ${az} out of range. check survey`);
+                throw new Error(`Azimuth ${az} out of range at row ${i+1}. check survey`);
             }
             return {md: md, inc: inc, az: az}
         }).sort((a, b) => a.md - b.md);
@@ -109,7 +144,12 @@ export async function render(state, mod, dataView, windowSize) {
     if (survey[0].md > 0.1) {
         survey.unshift({md:0, inc:0, az:0});
     }
-    survey[0] = {...survey[0], ...{ew:0, ns:0, tvd:0, x:0}};
+    return survey;
+}
+// Function to process the survey using minimum curvature algorithm
+function min_curvature_algo(survey) {
+    let processed_survey = [];
+    processed_survey.push({...survey[0], ...{ew:0, ns:0, tvd:0, x:0}});
     for (var i = 1; i < survey.length ; i++) {
         const I1 = survey[i-1].inc * Math.PI / 180;
         const I2 = survey[i].inc * Math.PI / 180;
@@ -125,13 +165,13 @@ export async function render(state, mod, dataView, windowSize) {
         const dx = 0.5* dmd * rf * (Math.sin(I1)* Math.sin(A1)+Math.sin(I2)* Math.sin(A2));
         const dy = 0.5* dmd * rf * (Math.sin(I1)* Math.cos(A1)+Math.sin(I2)* Math.cos(A2));
         const ds = Math.sqrt(dx*dx+dy*dy);
-        let {ew, ns, tvd, x} = survey[i-1];
-        survey[i]["ew"]  = ew + dx;
-        survey[i]["ns"]  = ns + dy;
-        survey[i]["tvd"] = tvd + dz;
-        survey[i]["x"]   = x + ds;
+        let {ew, ns, tvd, x} = processed_survey[i-1];
+        processed_survey.push({...survey[i], ...{ew:ew+dx, ns:ns+dy, tvd:tvd+dz, x:x+ds}});
     };
-
+    return processed_survey;
+}
+// determine scales
+function get_scales(survey, margin, windowSize) {
     const ydomain = d3.extent(survey, p => p.tvd)
     // Define the Y scale
     let yScale = d3.scaleLinear()
@@ -145,60 +185,30 @@ export async function render(state, mod, dataView, windowSize) {
             .domain([xdomain[0] - 0.01*xdomain[1], 1.05* xdomain[1]]).nice(20)
             .range([margin.left, windowSize.width - margin.right]);
 
+    return {xScale: xScale, yScale: yScale}
+}
+// function to compute the slope along the survey
+function compute_slope(survey, xScale, yScale) {
     const i1 = survey.length - 1;
-    survey = survey.map((p,i,arr) => {
-            let m, theta;
-            if (i==0) {
-                m = (yScale(p.tvd)-yScale(arr[i+1].tvd))/(xScale(arr[i+1].x)-xScale(p.x));
-            } else if (i == i1) {
-                m = (yScale(arr[i-1].tvd)-yScale(p.tvd))/(xScale(p.x)-xScale(arr[i-1].x));
-            } else {
-                m =  0.5 * (yScale(p.tvd)-yScale(arr[i+1].tvd))/(xScale(arr[i+1].x)-xScale(p.x));
-                m += 0.5 * (yScale(arr[i-1].tvd)-yScale(p.tvd))/(xScale(p.x)-xScale(arr[i-1].x));
-            }
-            theta = Math.atan(-1/m);
-            // console.log(`at md ${p.md}, x= ${p.x}, tvd = ${p.tvd}, m = ${m} and theta = ${theta}`)
-            theta = (theta >= 0) ? theta: Math.PI + theta;
-            p["theta"] = isNaN(theta) ? arr[i-1].theta : theta;
-            return p; 
-    });
-
-    let curve = d3.curveCatmullRom.alpha(1);
-
-    let line1 = d3
-        .line()
-        .x(d => xScale(d.x))
-        .y(d => yScale(d.tvd))
-        .curve(curve);
-
-    let line2 = d3
-        .line()
-        .x(d => xScale(d.x) + r * Math.cos(d.theta))
-        .y(d => yScale(d.tvd) - r * Math.sin(d.theta))
-        .curve(curve);
-
-    let line3 = d3
-        .line()
-        .x((d) => xScale(d.x) - r * Math.cos(d.theta))
-        .y((d) => yScale(d.tvd) + r * Math.sin(d.theta))
-        .curve(curve);
-
-    /**
-     * Sets the viewBox to match windowSize
-     */
-    svg.attr("viewBox", [0, 0, windowSize.width, windowSize.height]);
-    svg.selectAll("*").remove();
-
-    /**
-     * Prepare groups that will hold all elements of an area chart.
-     * The groups are drawn in a specific order for the best user experience:
-     * - 'histogram'
-     */
-    svg.append("g").attr("class", "wellbore");
-    /**
-     * Compute the suitable ticks to show
-     */
-    var xAxis = svg
+    for (var i = 0; i < survey.length ; i++) {
+        let m, theta;
+        if (i==0) {
+            m = (yScale(survey[i].tvd)-yScale(survey[i+1].tvd))/(xScale(survey[i+1].x)-xScale(survey[i].x));
+        } else if (i == i1) {
+            m = (yScale(survey[i-1].tvd)-yScale(survey[i].tvd))/(xScale(survey[i].x)-xScale(survey[i-1].x));
+        } else {
+            m =  0.5 * (yScale(survey[i].tvd)-yScale(survey[i+1].tvd))/(xScale(survey[i+1].x)-xScale(survey[i].x));
+            m += 0.5 * (yScale(survey[i-1].tvd)-yScale(survey[i].tvd))/(xScale(survey[i].x)-xScale(survey[i-1].x));
+        }
+        theta = Math.atan(-1/m);
+        // console.log(`at md ${survey[i].md}, x= ${survey[i].x}, tvd = ${survey[i].tvd}, m = ${m} and theta = ${theta}`)
+        theta = (theta >= 0) ? theta: Math.PI + theta;
+        survey[i]["theta"] = isNaN(theta) ? survey[i-1].theta : theta; 
+    }
+}
+// draw axes
+function draw_axes(container, xScale, yScale, windowSize, margin) {
+    container
         .append("g")
         .attr("transform", `translate(0,${windowSize.height - margin.bottom})`)
         .call(d3.axisBottom(xScale)
@@ -212,7 +222,8 @@ export async function render(state, mod, dataView, windowSize) {
             .attr("text-anchor", "start")
             .text('Distance (ft)'));
 
-    svg.append("g")
+    container
+        .append("g")
         .attr("transform", `translate(${margin.left},0)`)
         .call(
             d3.axisLeft(yScale)
@@ -226,65 +237,71 @@ export async function render(state, mod, dataView, windowSize) {
             .attr("fill", "currentColor")
             .attr("text-anchor", "start")
             .text('TVD (ft)')); 
+}
+// 
+function draw_wellbore(container, survey, xScale, yScale, curve, r, tooltip) {
+    // center line of the wellbore 
+    let line1 = d3
+        .line()
+        .x(d => xScale(d.x))
+        .y(d => yScale(d.tvd))
+        .curve(curve);
+    // top of casing
+    let line2 = d3
+        .line()
+        .x(d => xScale(d.x) + r * Math.cos(d.theta))
+        .y(d => yScale(d.tvd) - r * Math.sin(d.theta))
+        .curve(curve);
+    // bottom of casing
+    let line3 = d3
+        .line()
+        .x((d) => xScale(d.x) - r * Math.cos(d.theta))
+        .y((d) => yScale(d.tvd) + r * Math.sin(d.theta))
+        .curve(curve);
 
-    /**
-     * Style all strokes and text using current theme.
-     */
-    svg.selectAll("path").attr("stroke", styling.scales.line.stroke);
-    svg.selectAll("line").attr("stroke", styling.scales.tick.stroke);
-    svg.selectAll("text")
-        .attr("fill", styling.scales.font.color)
-        .attr("font-family", styling.scales.font.fontFamily)
-        .attr("font-size", styling.scales.font.fontSize);
+    container
+        .append("path")
+        .datum(survey)
+        .attr("stroke", "black")
+        .attr("stroke-width", 1)
+        .attr("stroke-dasharray",4)
+        .attr("fill", "none")
+        .attr("d", line1)
 
+    container
+        .append("path")
+        .datum(survey)
+        .attr("stroke", "red")
+        .attr("stroke-width", 2)
+        .attr("fill", "none")
+        .attr("d", line2);
 
-    /**
-     * Create aggregated groups, sort by sum and draw each one of them.
-     */
-        svg.select(".wellbore")
-            .append("path")
-            .datum(survey)
-            .attr("stroke", "black")
-            .attr("stroke-width", 1)
-            .attr("stroke-dasharray",4)
-            .attr("fill", "none")
-            .attr("d", line1)
+    container
+        .append("path")
+        .datum(survey)
+        .attr("stroke", "red")
+        .attr("stroke-width", 2)
+        .attr("fill", "none")
+        .attr("d", line3);
 
-        svg.select(".wellbore")
-            .append("path")
-            .datum(survey)
-            .attr("stroke", "red")
-            .attr("stroke-width", 2)
-            .attr("fill", "none")
-            .attr("d", line2);
-
-        svg.select(".wellbore")
-            .append("path")
-            .datum(survey)
-            .attr("stroke", "red")
-            .attr("stroke-width", 2)
-            .attr("fill", "none")
-            .attr("d", line3);
-
-        svg.select(".wellbore")
-            .selectAll("circle")
-            .data(survey)
-            .enter()
-            .append("circle")
-            .attr("stroke", "none")
-            .attr("fill", "none")
-            .attr("pointer-events", "all")
-            .attr("cx", d => xScale(d.x))
-            .attr("cy", d => yScale(d.tvd))
-            .attr("r", 5)
-            .on("mouseover", pointermoved)
-            .on("mouseout", () => tooltip.hide());
+    container
+        .selectAll("circle")
+        .data(survey)
+        .enter()
+        .append("circle")
+        .attr("stroke", "none")
+        .attr("fill", "none")
+        .attr("pointer-events", "all")
+        .attr("cx", d => xScale(d.x))
+        .attr("cy", d => yScale(d.tvd))
+        .attr("r", 5)
+        .on("mouseover", pointermoved)
+        .on("mouseout", () => tooltip.hide());
 
     function pointermoved(event, d) {
-        // const i = d3.bisectCenter(survey.map(d => d.x), xScale.invert(d3.pointer(event)[0]));
+    // const i = d3.bisectCenter(survey.map(d => d.x), xScale.invert(d3.pointer(event)[0]));
 
-        tooltip.show(` MD: ${d.md.toLocaleString('en-US', { maximumFractionDigits: 0 })} | TVD: ${d.tvd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
-        // setTimeout(() =>  tooltip.hide(), 5000);
+    tooltip.show(` MD: ${d.md.toLocaleString('en-US', { maximumFractionDigits: 0 })} | TVD: ${d.tvd.toLocaleString('en-US', { maximumFractionDigits: 0 })}`);
+    // setTimeout(() =>  tooltip.hide(), 5000);
     }
-
 }
